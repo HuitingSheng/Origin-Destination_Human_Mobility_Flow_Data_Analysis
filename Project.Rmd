@@ -1,0 +1,533 @@
+---
+title: "STAT685_ODFlow_final"
+author: "Huiting Sheng, James Cadena, Mike Pfahler, Thomas Nadobny"
+date: "05/08/2021"
+output: html_document
+---
+
+# Import libraries 
+```{r, message=FALSE}
+# load package, install package if it is not installed
+packages = c("data.table","sf", "bit64", "rjson","reshape2", "od","tidyverse","stplanr","ggmap","plotly","fields",
+             "BBmisc","bipartite", "bibloco","devtools","car", "gridExtra") 
+
+package.check = lapply(packages,
+                       FUN = function(x) {
+                        if (!require(x, character.only = TRUE)) {
+                          install.packages(x, dependencies = TRUE)
+                          library(x, character.only = TRUE)
+                        }
+                       }
+                      )
+```
+
+# Load data
+```{r, message = F}
+# set working directory
+setwd("/Users/huitingsheng/Downloads/Github/Origin-Destination_Human_Mobility_Flow_Data_Analysis")
+
+raw.df = fread('HT_sf_bg_2.csv') 
+load("HT_district.Rdata") 
+
+```
+
+
+# Data PreProcessing
+
+combine data and clean data by removing duplicate and NA records and converting destination_cbgs to standard json format
+```{r, cache= T}
+# join Ht_district with raws.df
+df_combined = HT_district %>% select(GEOID) %>% left_join(raw.df %>% mutate(GEOID = as.character(GEOID)), by = 'GEOID')
+
+# clean up the file. remove duplicate records and records have missing value, convert destination_cbgs into standard json format. add a new column for day of week. 
+df = df_combined %>% na.omit %>% unique %>% mutate(DOW = lapply(as.Date(date), weekdays), destination_cbgs= str_replace_all(destination_cbgs,"\"\"\"\"\"\"\"", "")) 
+
+```
+
+Only extract Harris County and Fort Bend County data, and seperate into weekdays and weekends. For weekday data, we exclude holidays, which is New Year(1/1/2020) and Martin Luther King Jr. Day(01/20/2020). We also add row number to each record for later combination
+
+```{r, cache = T}
+weekdays = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
+weekends = c("Saturday","Sunday")
+counties = c("Harris County", "Fort Bend County")
+`%notin%` = Negate(`%in%`)
+
+# extract weekday data
+data.weekdays = df %>% 
+                filter(DOW %in% weekdays & County %in% counties & date %notin% c('2020-01-01','2020-01-20')) %>%
+                rename(Origin = GEOID) %>% # rename GEOID to Origin
+                mutate(id = row_number()) 
+
+# extract weekend data
+data.weekend = df %>% 
+               filter(DOW %in% weekends & County %in% counties) %>%
+               rename(Origin = GEOID) %>% # rename GEOID to Origin
+               mutate(id = row_number()) 
+```
+
+PreProcessing data
+```{r, cache = T}
+# parsing json string into data table
+json_parse_weekdays = lapply(data.weekdays$destination_cbgs, fromJSON) %>%melt
+colnames(json_parse_weekdays) = c("Count", "Destination","id")
+
+json_parse_weekend = lapply(data.weekend$destination_cbgs, fromJSON) %>%melt
+colnames(json_parse_weekend) = c("Count", "Destination","id")
+
+# join with HT_district to get the Destination geometry
+json_parse_weekdays = json_parse_weekdays %>% inner_join(HT_district, by = c("Destination" = "GEOID")) %>% select(Count,Destination,id, geometry)
+json_parse_weekend = json_parse_weekend %>% inner_join(HT_district, by = c("Destination" = "GEOID")) %>% select(Count,Destination,id, geometry)
+
+# combine data with parsed json data and remove record that origin = destination
+data.weekdays = data.weekdays %>% inner_join(json_parse_weekdays, by = 'id') %>% filter(Origin != Destination) %>% select(-c(destination_cbgs,id)) 
+data.weekend = data.weekend %>% inner_join(json_parse_weekend, by = 'id') %>% filter(Origin != Destination) %>% select(-c(destination_cbgs,id)) 
+
+
+# aggregation: add a new column "ratio", which indicate the ratio of destination device count to total leaving device count
+data.weekdays.agg = data.weekdays %>% st_drop_geometry %>% 
+                    select(Origin, Destination, Count, DeviceCount, completely_home_device_count) %>% 
+                    group_by(Origin, Destination) %>% 
+                    summarise(ratio = sum(Count)/sum(DeviceCount - completely_home_device_count))
+
+
+data.weekend.agg = data.weekend %>% st_drop_geometry %>% 
+                   select(Origin, Destination, Count, DeviceCount, completely_home_device_count) %>% 
+                   group_by(Origin, Destination) %>% 
+                   summarise(ratio = sum(Count)/sum(DeviceCount - completely_home_device_count))
+
+
+# add distance between origin and destination
+data.weekday.sf = data.weekdays.agg %>%
+                  inner_join(HT_district, by = c("Origin" = "GEOID"), keep="geometry") %>%
+                  inner_join(HT_district, by = c("Destination" = "GEOID")) %>% 
+                  select(Origin, Destination, ratio, geometry.x, geometry.y ) 
+
+data.weekday.distance = data.weekday.sf %>%
+                        cbind(distance.mile=as.matrix(
+                                          rdist.earth.vec(
+                                                        st_coordinates(st_centroid(data.weekday.sf$geometry.x)),
+                                                        st_coordinates(st_centroid(data.weekday.sf$geometry.y)), 
+                                                        miles = T
+                                                        ))) %>% 
+                        select(Origin, Destination, ratio, distance.mile)
+
+
+data.weekend.sf = data.weekend.agg %>%
+                  inner_join(HT_district, by = c("Origin" = "GEOID"), keep="geometry") %>%
+                  inner_join(HT_district, by = c("Destination" = "GEOID")) %>% 
+                  select(Origin, Destination, ratio, geometry.x, geometry.y ) 
+
+data.weekend.distance = data.weekend.sf %>%
+                        cbind(distance.mile=as.matrix(
+                                          rdist.earth.vec(
+                                                        st_coordinates(st_centroid(data.weekend.sf$geometry.x)),
+                                                        st_coordinates(st_centroid(data.weekend.sf$geometry.y)), 
+                                                        miles = T
+                                                        ))) %>% 
+                        select(Origin, Destination, ratio, distance.mile)
+
+
+```
+
+
+generate OD Matrix for weekday and weekend
+```{r, cache = T}
+# generate OD Matrix for weekeday
+OD_Matrix_weekday= data.weekdays.agg %>% od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>% as.data.frame %>% 
+                   select(sort(names(.))) %>% slice(order(rownames(.))) # sort the row name and column names by the GEOID
+
+# generate OD Matrix for weekend
+OD_Matrix_weekend= data.weekend.agg %>%  od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>% as.data.frame %>% 
+                   select(sort(names(.))) %>% slice(order(rownames(.))) # sort the row name and column names by the GEOID
+  
+```
+
+
+set up a threshold, and generate a new matrix based on the threshold
+```{r, cache = T}
+threshold = 0.15
+data.weekdays.threshold = data.weekdays.agg %>% filter(ratio >= threshold)
+data.weekend.threshold = data.weekend.agg %>% filter(ratio >= threshold)
+
+# generate a new OD matrix based on the threshold
+Matrix_weekday_threshold = data.weekdays.threshold %>%  od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>% as.data.frame %>% 
+                           select(sort(names(.))) %>% slice(order(rownames(.))) # sort the row name and column names by the GEOID
+Matrix_weekend_threshold = data.weekend.threshold %>%  od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>% as.data.frame %>% 
+                           select(sort(names(.))) %>% slice(order(rownames(.))) # sort the row name and column names by the GEOID
+```
+
+
+
+# Visulization
+
+First, let take a look the most popular destination on weekdays and weekend
+```{r}
+# weekday: calculate the total destination device counts group by date and Destination
+destination_weekday = data.weekdays %>% st_drop_geometry() %>% group_by(date, Destination) %>% summarise(total = sum(Count))
+
+# weekday: calculate the daily destination device counts and add the geometry
+destination_weekday_1 = HT_district %>% 
+                        inner_join(destination_weekday %>% group_by(Destination) %>% summarise(total = sum(total)/21) %>% arrange(desc(total)), 
+                                   by=c("GEOID" = "Destination"), keep="geometry") %>%
+                        select(GEOID, total, geometry) %>% rename(Destination = GEOID)
+
+# weekend: calculate the total destination device counts group by date and Destination
+destination_weekend = data.weekend %>% st_drop_geometry() %>% group_by(date, Destination) %>% summarise(total = sum(Count))
+
+# weekend: calculate the daily destination device counts and add the geometry
+destination_weekend_1 = HT_district %>% 
+                        inner_join(destination_weekend %>% group_by(Destination) %>% summarise(total = sum(total)/8) %>% arrange(desc(total)), 
+                                   by=c("GEOID" = "Destination"), keep="geometry") %>%
+                        select(GEOID, total, geometry) %>% rename(Destination = GEOID)
+
+```
+
+
+plot the most popular destination of weekday and weekend
+```{r}
+library(gridExtra)
+# plot the most popular destination of weekday and weekend
+bbox = c(left = -96.1, bottom = 29.3, right = -94.9, top = 30.2)
+HSmap = get_stamenmap(bbox = bbox, zoom = 10)
+destination_weekday_map = ggmap(HSmap)+
+                          geom_sf(data = destination_weekday_1 %>% filter(total >= 1000), aes(fill = total), alpha=0.5, inherit.aes = FALSE) +
+                          coord_sf(crs = st_crs(HT_district))  +
+                          labs(title = "Most popular destination on weekday") +
+                          theme(plot.title = element_text(size = 9, face="bold"),
+                                legend.title = element_text(size = 7),
+                                legend.text  = element_text(size = 5),
+                                legend.key.size = unit(0.5, "lines"),
+                                axis.text.x = element_text(angle = 90, size = 5),
+                                axis.text.y = element_text(size = 7),
+                                axis.title = element_text(size=7, face="bold")
+                                )
+
+destination_weekend_map = ggmap(HSmap) +
+                          geom_sf(data = destination_weekend_1 %>% filter(total >= 1000), aes(fill = total), alpha=0.5, inherit.aes = FALSE) +
+                          coord_sf(crs = st_crs(HT_district)) +
+                          labs(title = "Most popular destination on Weekend") +
+                          theme(plot.title = element_text(size = 9, face="bold"),
+                                legend.title = element_text(size = 7),
+                                legend.text  = element_text(size = 5),
+                                legend.key.size = unit(0.5, "lines"),
+                                axis.text.x = element_text(angle = 90, size = 5),
+                                axis.text.y = element_text(size = 7),
+                                axis.title = element_text(size=7, face= "bold")
+                                )
+
+
+grid.arrange(destination_weekday_map, destination_weekend_map, ncol=2)
+
+```
+
+
+
+
+## ratio vs distance 
+```{r}
+# weekday plot
+ratio_distance_weekday = ggplot(data=data.weekday.distance, aes(x=distance.mile,y=ratio)) + geom_point() + xlim(0, 100) + ylim(0,0.5)+
+                          labs(title = "Figure 1: Ratio vs Distance (mile) for weekday", x = "Distance(mile)", y = "ratio") +
+                          theme(plot.title = element_text(size = 9, face="bold"),
+                                legend.title = element_text(size = 7),
+                                legend.text  = element_text(size = 5),
+                                legend.key.size = unit(0.5, "lines"),
+                                axis.text.x = element_text(size = 5),
+                                axis.text.y = element_text(size = 7),
+                                axis.title = element_text(size=7, face= "bold")
+                                )
+
+# weekend plot
+ratio_distance_weekend = ggplot(data = data.weekend.distance, aes(x = distance.mile, y = ratio)) + geom_point() + xlim(0, 100) + ylim(0,0.5)+ 
+                         labs(title = "Figure 2: Ratio vs Distance (mile) for weekend",  x = "Distance(mile)", y = "ratio") +
+                         theme(plot.title = element_text(size = 9, face="bold"),
+                                legend.title = element_text(size = 7),
+                                legend.text  = element_text(size = 5),
+                                legend.key.size = unit(0.5, "lines"),
+                                axis.text.x = element_text( size = 5),
+                                axis.text.y = element_text(size = 7),
+                                axis.title = element_text(size=7, face= "bold")
+                                )
+
+grid.arrange(ratio_distance_weekday, ratio_distance_weekend, ncol=2, heights=c(2.5/4, 1.5/4))
+
+
+# weekday + weekend plot
+data.all = rbind(data.weekday.distance%>%mutate(cat = "weekday"),data.weekend.distance%>%mutate(cat = "weekend"))
+
+ggplot(data=data.all, aes(x=distance.mile,y=ratio, color= cat)) +geom_point(alpha = 0.3)+ xlim(0, 100) + ylim(0,0.5) + labs(title = "Figure 3: Ratio vs Distance (mile) for weekday and weekend ", x = "Distance(mile)", y = "ratio")
+
+distance_dist = ggplot(data= data.all, aes(x = distance.mile, fill = cat)) + geom_density(alpha = 0.3) +
+                labs(title = "Figure 3: Distance Distribution",  x = "Distance (mile)") +
+                theme(plot.title = element_text(size = 9, face="bold"),
+                                  legend.title = element_text(size = 7),
+                                  legend.text  = element_text(size = 5),
+                                  legend.key.size = unit(0.5, "lines"),
+                                  axis.text.x = element_text( size = 5),
+                                  axis.text.y = element_text(size = 7),
+                                  axis.title = element_text(size=7, face= "bold")
+                                  )
+
+            
+ratio_dist = ggplot(data= data.all, aes(x = ratio, fill = cat)) + geom_density(alpha = 0.3) +
+             labs(title = "Figure 4: Ratio Distribution",  x = "Ratio") +
+             theme(plot.title = element_text(size = 9, face="bold"),
+                                legend.title = element_text(size = 7),
+                                legend.text  = element_text(size = 5),
+                                legend.key.size = unit(0.5, "lines"),
+                                axis.text.x = element_text( size = 5),
+                                axis.text.y = element_text(size = 7),
+                                axis.title = element_text(size=7, face= "bold")
+                                )
+
+grid.arrange(distance_dist, ratio_dist, ncol=2, heights=c(2.5/4, 1.5/4))
+```
+
+
+
+## Origin and Destination on Map for ratio greater than 0.1
+```{r}
+
+od.weekday.inner =  data.weekdays.threshold %>% filter(Origin %notin% c("480399900000","481679900000","480717106001","480719900000") & 
+                                                       Destination %notin% c("480399900000","481679900000","480717106001","480719900000"))
+
+od.weekend.inner =  data.weekend.threshold %>% filter(Origin %notin% c("480399900000","481679900000","480717106001","480719900000") & 
+                                                       Destination %notin% c("480399900000","481679900000","480717106001","480719900000"))
+
+                                       
+l_weekday = od2line(flow = od.weekday.inner, zones = HT_district)
+l_weekend = od2line(flow = od.weekend.inner, zones = HT_district)
+
+
+library(leaflet)
+leaflet() %>%
+  addTiles() %>%
+  addPolylines(data = l_weekday )
+
+leaflet() %>%
+  addTiles() %>%
+  addPolylines(data = l_weekend )
+```
+
+
+
+
+# Model
+## Gaussian for weekday
+```{r}
+#gaussian_matrix_weekday <- as.matrix( Matrix_weekday_threshold )
+gaussian_weekday_adjusted = logit(data.weekdays.threshold$ratio, 
+                                  percents=max(data.weekdays.threshold$ratio, na.rm = TRUE) > 1, 
+                                  adjust=0)
+
+data.weekdays.threshold$ratio = gaussian_weekday_adjusted
+
+gaussian_matrix_weekday = data.weekdays.threshold %>% od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>%
+                          as.data.frame %>% select(sort(names(.))) %>% slice(order(rownames(.)))
+
+params = list(alpha=2, kappa=1/var(as.numeric(gaussian_weekday_adjusted)), delta = 2, gamma=4, xi = mean(gaussian_weekday_adjusted))
+
+
+iidx = NULL
+jidx = NULL
+x = NULL
+for(i in 1:nrow(gaussian_matrix_weekday))
+{
+	for(j in 1:ncol(gaussian_matrix_weekday))
+	{
+		if(gaussian_matrix_weekday[i,j] != 0)
+		{
+			iidx = c(iidx,i)
+			jidx = c(jidx,j)
+			x = c(x,gaussian_matrix_weekday[i,j])
+		}
+	}
+}
+mat.dims = c(nrow(gaussian_matrix_weekday), ncol(gaussian_matrix_weekday))
+
+fit_non_sparse_weekday = bibloco.fit(as.matrix(gaussian_matrix_weekday),
+                                     model.type = "Gaussian", 
+                                     model.params = params, 
+                                     alg.type ="greedy",  
+                                     init.type = 0, 
+                                     n.runs = 10, 
+                                     matrix.dims = mat.dims,
+                                     init.groups = c(100, ncol(gaussian_matrix_weekday)), 
+                                     n.restarts = 2,  
+                                     greedy.fast = TRUE, 
+                                     greedy.merge =TRUE, 
+                                     keepICL = FALSE,
+                                     row.index = iidx-1, 
+                                     col.index = jidx-1,
+                                     values = x,
+                                     sparse = FALSE, 
+                                     delta = 0.05,
+                                     merge.thresh = 0., 
+                                     n.margin = 2)
+
+```
+
+### weekday origination
+```{r}
+
+weekday_origin = rownames(gaussian_matrix_weekday[fit_non_sparse_weekday$plotting$rows$order,])
+weekday_origin_group = c()
+for (i in 1:fit_non_sparse_weekday$ngroups[1]){
+  weekday_origin_group = c(weekday_origin_group, rep(i, length(fit_non_sparse_weekday$plotting$rows$cluster.members[[i]])))
+}
+
+origin_weekday = data.frame(weekday_origin, weekday_origin_group)
+
+origin_weekday_sf = HT_district %>% inner_join(origin_weekday, by =c("GEOID" = "weekday_origin"))
+
+```
+
+plot weekday origination cluster
+```{r}
+bbox=c(left = -96.1, bottom = 29.2, right = -94.9, top = 30.2)  
+HSmap <- get_stamenmap(bbox = bbox, zoom=10)
+origin_weekday_map = ggmap(HSmap)+
+                     geom_sf(data = origin_weekday_sf,  aes(fill = factor(weekday_origin_group)), alpha=0.5, inherit.aes = FALSE) +
+                     coord_sf(crs = st_crs(HT_district)) + 
+                     labs(fill = 'Clusters', title = 'Weekday Origin')
+
+origin_weekday_map
+
+```
+
+
+### weekday destination
+```{r}
+weekday_dest = colnames(gaussian_matrix_weekday[,fit_non_sparse_weekday$plotting$columns$order])
+weekday_dest_group = c()
+for (i in 1:fit_non_sparse_weekday$ngroups[2]){
+  weekday_dest_group = c(weekday_dest_group, rep(i,length(fit_non_sparse_weekday$plotting$columns$cluster.members[[i]])))
+}
+
+destination_weekday = data.frame(weekday_dest, weekday_dest_group)
+
+destination_weekday_sf = HT_district %>% inner_join(destination_weekday, by = c("GEOID"="weekday_dest"))
+
+```
+
+plot weekday destination cluster
+```{r}
+bbox=c(left = -96.1, bottom = 29.2, right = -94.9, top = 30.2)  
+HSmap <- get_stamenmap(bbox = bbox, zoom=10)
+dest_weekday_map = ggmap(HSmap) +
+                   geom_sf(data = destination_weekday_sf, aes(fill = factor(weekday_dest_group)), alpha=0.5, inherit.aes = FALSE) +
+                   coord_sf(crs = st_crs(HT_district)) + 
+                   labs(fill = 'Clusters', title='Weekday Destination')
+
+dest_weekday_map
+
+```
+
+
+## Gaussian for weekend
+```{r}
+gaussian_weekend_adjusted = logit(data.weekend.threshold$ratio, 
+                                  percents=max(data.weekend.threshold$ratio, na.rm = TRUE) > 1, adjust=0)
+
+data.weekend.threshold$ratio = gaussian_weekend_adjusted
+
+gaussian_matrix_weekend = data.weekend.threshold %>% od_to_odmatrix(attrib = 'ratio') %>% replace_na(0) %>%
+                          as.data.frame %>% select(sort(names(.))) %>% 
+                          slice(order(rownames(.)))
+
+params = list(alpha = 2, kappa = 1/var(as.numeric(gaussian_weekend_adjusted)), delta = 2, gamma = 4, xi = mean(gaussian_weekend_adjusted))
+
+iidx = NULL
+jidx = NULL
+x = NULL
+for(i in 1:nrow(gaussian_matrix_weekend))
+{
+	for(j in 1:ncol(gaussian_matrix_weekend))
+	{
+		if(gaussian_matrix_weekend[i,j] != 0)
+		{
+			iidx = c(iidx,i)
+			jidx = c(jidx,j)
+			x = c(x,gaussian_matrix_weekend[i,j])
+		}
+	}
+}
+mat.dims = c(nrow(gaussian_matrix_weekend), ncol(gaussian_matrix_weekend))
+
+fit_non_sparse_weekend = bibloco.fit(as.matrix(gaussian_matrix_weekend),
+                                     model.type = "Gaussian", 
+                                     model.params = params, 
+                                     alg.type = "greedy",  
+                                     init.type = 0, 
+                                     n.runs = 10, 
+                                     matrix.dims = mat.dims,
+                                     init.groups = c(100,ncol(gaussian_matrix_weekend)), 
+                                     n.restarts = 2,  
+                                     greedy.fast = TRUE, 
+                                     greedy.merge =TRUE, 
+                                     keepICL = FALSE,
+                                     row.index = iidx-1, 
+                                     col.index = jidx-1,
+                                     values = x,
+                                     sparse = FALSE, 
+                                     delta = 0.05,
+                                     merge.thresh = 0., 
+                                     n.margin = 2)
+
+```
+
+### weekend origination
+```{r}
+
+weekend_origin = rownames(gaussian_matrix_weekend[fit_non_sparse_weekend$plotting$rows$order,])
+weekend_origin_group = c()
+for (i in 1:fit_non_sparse_weekend$ngroups[1]){
+  weekend_origin_group = c(weekend_origin_group, rep(i, length(fit_non_sparse_weekend$plotting$rows$cluster.members[[i]])))
+}
+
+origin_weekend = data.frame(weekend_origin, weekend_origin_group)
+
+origin_weekend_sf = HT_district %>% inner_join(origin_weekend, by =c("GEOID" = "weekend_origin"))
+
+```
+
+```{r}
+
+bbox=c(left = -96.1, bottom = 29.2, right = -94.9, top = 30.2)  
+HSmap <- get_stamenmap(bbox = bbox,zoom = 10)
+origin_weekend_map = ggmap(HSmap)+
+                     geom_sf(data = origin_weekend_sf, aes(fill = factor(weekend_origin_group)), alpha = 0.5, inherit.aes = FALSE) +
+                     coord_sf(crs = st_crs(HT_district)) + 
+                     labs(fill = 'Clusters', title = 'Weekend Origin')
+
+origin_weekend_map
+
+```
+
+
+### weekend destination
+```{r}
+weekend_dest = colnames(gaussian_matrix_weekend[,fit_non_sparse_weekend$plotting$columns$order])
+weekend_dest_group = c()
+for (i in 1:fit_non_sparse_weekend$ngroups[2]){
+  weekend_dest_group = c(weekend_dest_group, rep(i,length(fit_non_sparse_weekend$plotting$columns$cluster.members[[i]])))
+}
+
+destination_weekend = data.frame(weekend_dest, weekend_dest_group)
+
+destination_weekend_sf = HT_district %>% inner_join(destination_weekend, by = c("GEOID" = "weekend_dest"))
+
+```
+
+```{r}
+
+bbox=c(left = -96.1, bottom = 29.2, right = -94.9, top = 30.2)  
+HSmap = get_stamenmap(bbox = bbox,zoom = 10)
+dest_weekend_map = ggmap(HSmap) +
+                   geom_sf(data = destination_weekend_sf, aes(fill = factor(weekend_dest_group)), alpha=0.5, inherit.aes = FALSE) +
+                   coord_sf(crs = st_crs(HT_district)) + 
+                   labs(fill = 'Clusters', title = 'Weekend Destination')
+
+dest_weekend_map
+
+```
